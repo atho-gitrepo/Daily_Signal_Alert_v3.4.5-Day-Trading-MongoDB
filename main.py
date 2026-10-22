@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
-AI Trading Bot v3.4.1 - Main Entry Point
+AI Trading Bot v3.4.5 - Main Entry Point
 Super TDI + MACD + Super Bollinger Bands Strategy
-ALIGNED WITH MANUAL STRATEGY: RSI (TDI) primary + MACD secondary + BB entry
-FIXED: UnboundLocalError and duplicate prevention
+FIXED: SignalEngine created once (not per-symbol), version centralized, condition_5 wired up
 """
 
 import os
@@ -17,33 +16,20 @@ from typing import Dict, Any, Optional, List
 from datetime import datetime, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
-import signal as signal_module  # ← FIXED: Import as different name
+import signal as signal_module
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # ========== IMPORTS ==========
 
-# Settings
 from settings import config
-
-# Data Fetcher
 from utils.binance_data_client import binance_client
-
-# MongoDB
 from utils.mongodb_client import mongodb_client
-
-# Indicators
 from utils import calculate_all_indicators
 from utils.indicators import Indicators
-
-# Signal Manager
 from utils.signal_manager import signal_manager
-
-# Telegram
 from utils.telegram_bot import telegram_bot
-
-# Strategy - Super TDI + MACD + Super Bollinger Bands
 from strategy.signal_engine import SignalEngine
 from strategy.ai_analyzer import ai_analyzer
 from strategy.cheat_sheet import SignalCheatSheet
@@ -51,12 +37,9 @@ from utils.logger import get_logger
 
 # ========== LOGGING ==========
 
-# Create logs directory
 os.makedirs('logs', exist_ok=True)
-
 logger = get_logger(__name__)
 
-# Emoji indicators
 EMOJI = {
     "START": "🚀", "STOP": "🛑", "SUCCESS": "✅", "ERROR": "❌",
     "WARNING": "⚠️", "INFO": "ℹ️", "SIGNAL": "📡", "HEALTH": "💚",
@@ -70,7 +53,6 @@ EMOJI = {
     "BB": "📊", "MACD": "📊", "CANDLE": "🕯️", "CHEAT": "📋",
     "EXIT": "⏰", "RESTORE": "♻️", "ACTIVE": "🔴",
 }
-
 
 # ========== GLOBAL STATE ==========
 
@@ -92,7 +74,7 @@ bot_stats = {
     },
     'total_pnl': 0.0,
     'errors': 0,
-    'version': '3.4.5',
+    'version': config.VERSION,
     'strategy': 'Super TDI + MACD + Super Bollinger Bands',
     'ai_enabled': ai_analyzer.enabled if ai_analyzer else False,
     'mongodb_enabled': mongodb_client.is_available() if mongodb_client else False,
@@ -112,7 +94,6 @@ bot_stats = {
     },
 }
 
-
 # ========== DATA FETCHER WRAPPER ==========
 
 class DataFetcherWrapper:
@@ -126,7 +107,6 @@ class DataFetcherWrapper:
             logger.warning(f"{EMOJI['WARNING']} Data fetcher not available")
 
     def fetch_klines(self, symbol: str, interval: str = '5m', limit: int = 200):
-        """Fetch klines data."""
         if self._client is not None:
             try:
                 df = self._client.get_historical_klines(
@@ -142,7 +122,6 @@ class DataFetcherWrapper:
         return None
 
     def fetch_current_price(self, symbol: str) -> Optional[float]:
-        """Fetch current price."""
         if self._client is not None:
             try:
                 return self._client.get_current_price(symbol)
@@ -151,7 +130,6 @@ class DataFetcherWrapper:
         return None
 
     def cleanup(self):
-        """Clean up resources."""
         if self._client is not None:
             try:
                 self._client.cleanup()
@@ -162,6 +140,12 @@ class DataFetcherWrapper:
 # Create singleton
 data_client = DataFetcherWrapper()
 
+# ========== SIGNAL ENGINE (created ONCE, shared across all symbols) ==========
+# FIX: This used to be re-instantiated inside process_symbol() on every cycle,
+# which produced the repeated "Signal Engine initialized" log spam and caused
+# needless memory churn on low-RAM VMs.
+signal_engine = SignalEngine(use_ai=ai_analyzer.enabled if ai_analyzer else False)
+
 
 # ========== RECOVERY FUNCTIONS ==========
 
@@ -170,36 +154,29 @@ def recover_and_sync_signals():
     if not mongodb_client.is_available():
         logger.warning(f"{EMOJI['WARNING']} MongoDB not available - skipping recovery")
         return
-    
+
     try:
         logger.info(f"{EMOJI['RESTORE']} Syncing active signals with database...")
-        
-        # Sync signal manager with database
         signal_manager.sync_with_database()
-        
-        # Also check for any orphaned signals in DB
+
         active_db = mongodb_client.get_active_signals()
         if active_db:
             logger.info(f"{EMOJI['INFO']} Found {len(active_db)} active signals in database")
-            
-            # Ensure all DB signals are in memory
             for doc_id, db_signal in active_db.items():
                 symbol = db_signal.get('symbol')
                 if symbol and not signal_manager.is_symbol_locked(symbol):
                     signal_manager._recover_from_db(symbol)
-        
-        # Clean up orphaned signals
+
         cleaned = mongodb_client.cleanup_orphaned_active_signals()
         if cleaned > 0:
             logger.info(f"{EMOJI['SUCCESS']} Cleaned up {cleaned} orphaned signals")
-            
-        # Log recovered signals
+
         active = signal_manager.get_all_active_signals()
         if active:
             logger.info(f"{EMOJI['ACTIVE']} Active signals after recovery: {len(active)}")
-            for symbol, signal in active.items():
-                logger.info(f"  {symbol}: entry={signal.entry_price:.4f}, age={signal.get_age_minutes():.1f}min, doc={signal.db_doc_id}")
-            
+            for symbol, sig in active.items():
+                logger.info(f"  {symbol}: entry={sig.entry_price:.4f}, age={sig.get_age_minutes():.1f}min, doc={sig.db_doc_id}")
+
     except Exception as e:
         logger.error(f"{EMOJI['ERROR']} Recovery failed: {e}")
         import traceback
@@ -214,11 +191,8 @@ def fetch_data(symbol: str, timeframe: str = '5m') -> Optional[pd.DataFrame]:
         df = data_client.fetch_klines(symbol, timeframe, 200)
         if df is None or df.empty:
             return None
-
-        # Calculate all indicators (includes MACD now)
         df = calculate_all_indicators(df)
         return df
-
     except Exception as e:
         logger.error(f"Data fetch error for {symbol}: {e}")
         return None
@@ -239,7 +213,6 @@ def check_conditions(signal_data: Dict[str, Any]) -> Dict[str, Any]:
 
     conditions_met = sum(1 for v in conditions.values() if v)
     conditions_total = 5
-
     min_conditions = getattr(config.strategy, 'min_conditions_for_signal', 3)
     is_valid = conditions_met >= min_conditions
 
@@ -253,30 +226,28 @@ def check_conditions(signal_data: Dict[str, Any]) -> Dict[str, Any]:
 
 def process_symbol(symbol: str) -> Optional[Dict[str, Any]]:
     """Process a single symbol with duplicate prevention."""
-    
+
     if signal_manager is None:
         logger.warning(f"{EMOJI['WARNING']} Signal manager not available for {symbol}")
         return None
 
     try:
-        # ===== STEP 1: Check lock (memory + DB) =====
+        # STEP 1: Check lock (memory + DB)
         if signal_manager.is_symbol_locked(symbol):
             return None
 
-        # ===== STEP 2: Fetch data =====
+        # STEP 2: Fetch data
         df = fetch_data(symbol, config.market.timeframe)
         if df is None:
             return None
 
-        # Fetch HTF data for context only
         htf_df = fetch_data(symbol, config.market.htf_timeframe)
         if htf_df is None:
             logger.debug(f"{symbol}: No HTF data available, continuing without context")
             htf_df = None
 
-        # ===== STEP 3: Process signal =====
-        signal_engine = SignalEngine(use_ai=ai_analyzer.enabled if ai_analyzer else False)
-        signal_data = signal_engine.process(df, symbol, htf_df=htf_df)  # ← Renamed to signal_data
+        # STEP 3: Process signal (uses the shared module-level engine)
+        signal_data = signal_engine.process(df, symbol, htf_df=htf_df)
 
         if signal_data is None or signal_data.get('signal') == 'NO_TRADE':
             return None
@@ -288,7 +259,7 @@ def process_symbol(symbol: str) -> Optional[Dict[str, Any]]:
         elif not df.empty:
             signal_data['entry_price'] = df['close'].iloc[-1]
 
-        # ===== STEP 4: Check conditions =====
+        # STEP 4: Check conditions (engine already sets these; this re-verifies)
         condition_check = check_conditions(signal_data)
 
         signal_data['conditions_met'] = condition_check['conditions_met']
@@ -299,10 +270,10 @@ def process_symbol(symbol: str) -> Optional[Dict[str, Any]]:
         signal_data['condition_4_candles_shrinking'] = condition_check['conditions'].get('condition_4_candles_shrinking', False)
         signal_data['condition_5_reversal_confirm'] = condition_check['conditions'].get('condition_5_reversal_confirm', False)
 
-        # ===== STEP 5: AI Decision =====
+        # STEP 5: AI Decision
         ai_decision = signal_data.get('ai_decision', 'NONE')
 
-        # ===== STEP 6: Build cheat sheet =====
+        # STEP 6: Build cheat sheet
         cheat_sheet_obj = SignalCheatSheet()
         if signal_data.get('direction') == 'BUY':
             signal_data['cheat_sheet'] = cheat_sheet_obj.generate_buy_cheat_sheet(signal_data)
@@ -311,10 +282,9 @@ def process_symbol(symbol: str) -> Optional[Dict[str, Any]]:
         else:
             signal_data['cheat_sheet'] = cheat_sheet_obj.generate_wait_cheat_sheet(signal_data)
 
-        # ===== STEP 7: Lock symbol if valid =====
+        # STEP 7: Lock symbol if valid
         if condition_check['valid']:
-            if ai_decision == 'APPROVE':
-                # Double-check lock before locking (prevents race conditions)
+            if ai_decision == 'APPROVE' or not ai_analyzer.enabled:
                 if signal_manager.is_symbol_locked(symbol):
                     logger.debug(f"{symbol}: Symbol was locked during processing - skipping")
                     return None
@@ -329,7 +299,6 @@ def process_symbol(symbol: str) -> Optional[Dict[str, Any]]:
                     if ai_decision == 'APPROVE':
                         bot_stats['ai_approved'] += 1
 
-                    # Send Telegram notification
                     if telegram_bot is not None and telegram_bot.enabled:
                         try:
                             telegram_bot.send_signal(
@@ -369,7 +338,6 @@ def process_symbol(symbol: str) -> Optional[Dict[str, Any]]:
                         except Exception as e:
                             logger.warning(f"Telegram error for {symbol}: {e}")
 
-                    # Print cheat sheet
                     cheat_sheet = signal_data.get('cheat_sheet', '')
                     if cheat_sheet:
                         print("\n" + "=" * 70)
@@ -405,7 +373,7 @@ def process_symbol(symbol: str) -> Optional[Dict[str, Any]]:
 
 
 def check_active_signals():
-    """Check and update active signals with enhanced logging."""
+    """Check and update active signals."""
     if signal_manager is None:
         return
 
@@ -415,25 +383,21 @@ def check_active_signals():
     if not active:
         return
 
-    # Monitor each active signal
-    for symbol, signal_obj in active.items():  # ← Renamed to signal_obj to avoid conflict
+    for symbol, signal_obj in active.items():
         try:
             current_price = data_client.fetch_current_price(symbol)
             if current_price is None:
                 continue
 
-            # Get current TDI from last candle for target exits
             last_candle = {}
             df = fetch_data(symbol, config.market.timeframe)
             if df is not None and not df.empty:
                 last_candle['tdi_slow_ma'] = df['tdi_slow_ma'].iloc[-1] if 'tdi_slow_ma' in df.columns else 50
 
-            # Check signal
             status, diff, updated = signal_manager.check_active_signal(
                 symbol, current_price, last_candle
             )
 
-            # Update stats based on exit status
             if status != "ACTIVE" and updated is not None:
                 exit_message = ""
                 if status == "PROFIT":
@@ -453,10 +417,8 @@ def check_active_signals():
                     exit_message = f"TDI TARGET EXIT ${updated.pnl:.2f}"
 
                 bot_stats['total_pnl'] += updated.pnl
-
                 logger.info(f"{EMOJI['EXIT']} {symbol}: {exit_message} | DB Doc: {updated.db_doc_id} | Conditions: {updated.conditions_met}/{updated.conditions_total}")
 
-                # Send Telegram result
                 if telegram_bot is not None and telegram_bot.enabled:
                     try:
                         telegram_bot.send_result(
@@ -504,12 +466,12 @@ def run_health_server():
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/json')
                 self.end_headers()
-                
+
                 active_signals = signal_manager.get_all_active_signals() if signal_manager else {}
-                
+
                 status_data = {
                     'status': 'running' if running else 'stopped',
-                    'version': '3.4.5',
+                    'version': config.VERSION,
                     'strategy': 'Super TDI + MACD + Super Bollinger Bands',
                     'timestamp': datetime.now().isoformat(),
                     'stats': bot_stats,
@@ -547,8 +509,7 @@ def run_health_server():
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/json')
                 self.end_headers()
-                result = {"message": "Force check initiated"}
-                self.wfile.write(json.dumps(result).encode())
+                self.wfile.write(json.dumps({"message": "Force check initiated"}).encode())
             else:
                 self.send_response(404)
                 self.end_headers()
@@ -563,7 +524,6 @@ def run_health_server():
 
 
 def signal_handler(sig, frame):
-    """Handle shutdown signals."""
     global running
     logger.info(f"{EMOJI['STOP']} Shutting down...")
     running = False
@@ -576,7 +536,7 @@ def main():
     global running
 
     logger.info("=" * 70)
-    logger.info(f"{EMOJI['START']} AI TRADING BOT v3.4.5")
+    logger.info(f"{EMOJI['START']} AI TRADING BOT v{config.VERSION}")
     logger.info("📊 SUPER TDI + MACD + SUPER BOLLINGER BANDS STRATEGY")
     logger.info("=" * 70)
     logger.info("📋 Strategy Features:")
@@ -611,28 +571,22 @@ def main():
     logger.info(f"📊 HTF Alignment Required: {'✅' if htf_required else '❌'} (DISABLED - Context Only)")
     logger.info("=" * 70)
 
-    # Setup signal handlers - FIXED: Use signal_module instead of signal
     signal_module.signal(signal_module.SIGINT, signal_handler)
     signal_module.signal(signal_module.SIGTERM, signal_handler)
 
-    # Start health server
     threading.Thread(target=run_health_server, daemon=True).start()
 
-    # ===== RECOVER ACTIVE SIGNALS FROM DATABASE =====
     recover_and_sync_signals()
 
-    # ===== LOG ACTIVE SIGNALS =====
     active = signal_manager.get_all_active_signals()
     if active:
         logger.info(f"{EMOJI['ACTIVE']} Active signals: {len(active)}")
-        for symbol, signal_obj in active.items():  # ← Renamed to signal_obj
-            logger.info(f"  {symbol}: entry={signal_obj.entry_price:.4f}, age={signal_obj.get_age_minutes():.1f}min, doc={signal_obj.db_doc_id}")
+        for symbol, sig in active.items():
+            logger.info(f"  {symbol}: entry={sig.entry_price:.4f}, age={sig.get_age_minutes():.1f}min, doc={sig.db_doc_id}")
 
-    # Symbols to monitor
     symbols = config.market.symbols
     logger.info(f"{EMOJI['MONITOR']} Monitoring {len(symbols)} symbols: {', '.join(symbols[:5])}...")
 
-    # Send startup message
     if telegram_bot.enabled:
         telegram_bot.send_startup_message(
             symbols=symbols,
@@ -657,14 +611,12 @@ def main():
             }
         )
 
-    # Main loop
     cycle = 0
     while running:
         try:
             cycle += 1
             start_time = time.time()
 
-            # Process each symbol
             for symbol in symbols:
                 if not running:
                     break
@@ -673,10 +625,8 @@ def main():
                 except Exception as e:
                     logger.error(f"Symbol {symbol} error: {e}")
 
-            # Check active signals (this handles exits)
             check_active_signals()
 
-            # Log status every 10 cycles
             if cycle % 10 == 0:
                 logger.info(
                     f"{EMOJI['MONITOR']} Cycle {cycle}: "
@@ -689,7 +639,6 @@ def main():
                     f"{bot_stats['errors']} errors"
                 )
 
-            # Sleep
             elapsed = time.time() - start_time
             polling_interval = getattr(config.market, 'polling_interval_seconds', 15)
             sleep_time = max(0, polling_interval - elapsed)
@@ -704,7 +653,6 @@ def main():
             traceback.print_exc()
             time.sleep(5)
 
-    # Cleanup
     logger.info(f"{EMOJI['STOP']} Shutting down...")
     try:
         if mongodb_client is not None:
@@ -713,7 +661,6 @@ def main():
     except Exception as e:
         logger.warning(f"Cleanup error: {e}")
 
-    # Send shutdown message
     if telegram_bot.enabled:
         telegram_bot.send_shutdown_message({
             'signals_generated': bot_stats['signals_generated'],

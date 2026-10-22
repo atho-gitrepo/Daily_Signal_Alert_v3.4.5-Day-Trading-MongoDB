@@ -41,10 +41,6 @@ services:
       - GROQ_ENABLED=${GROQ_ENABLED:-true}
       - GROQ_MODEL=${GROQ_MODEL:-llama-3.3-70b-versatile}
       - GROQ_TEMPERATURE=${GROQ_TEMPERATURE:-0.3}
-      - SYMBOLS=BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,XRPUSDT
-      - TIMEFRAME=5m
-      - HTF_TIMEFRAME=1h
-      - LOG_LEVEL=INFO
       # MongoDB Configuration
       - MONGODB_HOST=mongodb
       - MONGODB_PORT=27017

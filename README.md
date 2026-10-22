@@ -1,7 +1,7 @@
 # README.md
 
 ```markdown
-# 🤖 AI Trading Bot v3.4.1
+# 🤖 AI Trading Bot v3.4.5
 
 **Advanced Multi-Timeframe Trading Bot with Signal State Machine**
 
@@ -28,7 +28,7 @@
 
 ## 🚀 Overview
 
-The AI Trading Bot v3.4.1 is a sophisticated algorithmic trading system designed for Binance Futures. It implements a **multi-timeframe strategy** with a **state machine architecture** that separates setup detection from signal execution, ensuring high-quality entries with proper confirmation.
+The AI Trading Bot v3.4.5 is a sophisticated algorithmic trading system designed for Binance Futures. It implements a **multi-timeframe strategy** with a **state machine architecture** that separates setup detection from signal execution, ensuring high-quality entries with proper confirmation.
 
 ### Core Philosophy
 

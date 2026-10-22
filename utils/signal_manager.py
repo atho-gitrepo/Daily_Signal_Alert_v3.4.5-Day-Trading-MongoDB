@@ -5,7 +5,7 @@ ALIGNED WITH YOUR MANUAL STRATEGY:
 - EXIT: BUY → TDI 70, SELL → TDI 30
 - TP/SL: Always priority
 - Max hold: Force exit
-Version: 3.4.1 - FIXED: Duplicate prevention with database sync
+Version: 3.4.5 - FIXED: Duplicate prevention with database sync
 """
 
 import logging
